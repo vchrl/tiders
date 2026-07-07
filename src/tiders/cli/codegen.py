@@ -268,6 +268,7 @@ _TIDERS_CONFIG_CLASSES = {
     "EvmDecodeEventsConfig",
     "SvmDecodeInstructionsConfig",
     "SvmDecodeLogsConfig",
+    "OriginalColumns",
     "CastConfig",
     "CastByTypeConfig",
     "HexEncodeConfig",

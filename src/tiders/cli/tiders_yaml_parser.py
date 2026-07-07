@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import dataclasses
 import importlib.util
+import logging
 import re
 import sys
 from pathlib import Path
@@ -112,6 +113,7 @@ from tiders.config import (
     JoinBlockDataConfig,
     JoinEvmTransactionDataConfig,
     JoinSvmTransactionDataConfig,
+    OriginalColumns,
     PandasStepConfig,
     PolarsStepConfig,
     PostgresqlWriterConfig,
@@ -138,6 +140,8 @@ from tiders.config import (
     Writer,
     WriterKind,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class YamlConfigError(Exception):
@@ -965,12 +969,63 @@ def _parse_step(raw: dict[str, Any], index: int, yaml_dir: Path) -> Step:
 # Standard steps
 
 
+def _parse_original_columns(
+    raw: dict[str, Any], cfg_path: str, *, evm: bool
+) -> OriginalColumns:
+    """Resolve the ``original_columns`` mode for a decode step.
+
+    Accepts the new ``original_columns`` key, or the deprecated boolean
+    ``hstack`` alias (``True`` -> ``all``, ``False`` -> ``none``). Rejects
+    ``drop_except_topic0`` for non-EVM (SVM) decode steps.
+    """
+    if "original_columns" in raw and "hstack" in raw:
+        raise YamlConfigError(
+            "Specify only one of 'original_columns' or the deprecated 'hstack'.",
+            cfg_path,
+        )
+
+    if "original_columns" in raw:
+        value = raw["original_columns"]
+        try:
+            mode = OriginalColumns(value)
+        except ValueError:
+            raise YamlConfigError(
+                f"Invalid original_columns '{value}'. Must be one of: "
+                f"{[e.value for e in OriginalColumns]}.",
+                f"{cfg_path}.original_columns",
+            )
+        if mode is OriginalColumns.DROP_EXCEPT_TOPIC0 and not evm:
+            raise YamlConfigError(
+                "'drop_except_topic0' is only valid for EVM decode steps.",
+                f"{cfg_path}.original_columns",
+            )
+        return mode
+
+    if "hstack" in raw:
+        value = raw["hstack"]
+        if not isinstance(value, bool):
+            raise YamlConfigError(
+                "Deprecated 'hstack' must be a boolean; prefer 'original_columns'.",
+                f"{cfg_path}.hstack",
+            )
+        logger.warning(
+            "'hstack' is deprecated; use 'original_columns' "
+            "(all / none / drop_all_raw%s).",
+            " / drop_except_topic0" if evm else "",
+        )
+        return OriginalColumns.ALL if value else OriginalColumns.NONE
+
+    return OriginalColumns.ALL
+
+
 def _parse_step_config(kind: StepKind, raw: dict[str, Any], path: str) -> Any:
     """Parse a step's config dict into the appropriate config dataclass."""
     cfg_path = f"{path}.config"
 
     if kind == StepKind.EVM_DECODE_EVENTS:
-        valid_keys = {f.name for f in dataclasses.fields(EvmDecodeEventsConfig)}
+        valid_keys = {f.name for f in dataclasses.fields(EvmDecodeEventsConfig)} | {
+            "hstack"
+        }
         unknown = set(raw.keys()) - valid_keys
         if unknown:
             raise YamlConfigError(
@@ -989,7 +1044,7 @@ def _parse_step_config(kind: StepKind, raw: dict[str, Any], path: str) -> Any:
             filter_by_topic0=raw.get("filter_by_topic0", False),
             input_table=raw.get("input_table", "logs"),
             output_table=raw.get("output_table", "decoded_logs"),
-            hstack=raw.get("hstack", True),
+            original_columns=_parse_original_columns(raw, cfg_path, evm=True),
             large_int_as_binary=raw.get("large_int_as_binary", False),
         )
 
@@ -1417,7 +1472,9 @@ def _parse_svm_decode_instructions_config(
     raw: dict[str, Any], path: str
 ) -> SvmDecodeInstructionsConfig:
     """Parse svm_decode_instructions config including the instruction signature."""
-    valid_keys = {f.name for f in dataclasses.fields(SvmDecodeInstructionsConfig)}
+    valid_keys = {f.name for f in dataclasses.fields(SvmDecodeInstructionsConfig)} | {
+        "hstack"
+    }
     unknown = set(raw.keys()) - valid_keys
     if unknown:
         raise YamlConfigError(
@@ -1463,7 +1520,7 @@ def _parse_svm_decode_instructions_config(
         filter_by_discriminator=raw.get("filter_by_discriminator", False),
         input_table=raw.get("input_table", "instructions"),
         output_table=raw.get("output_table", "decoded_instructions"),
-        hstack=raw.get("hstack", True),
+        original_columns=_parse_original_columns(raw, path, evm=False),
     )
 
 
@@ -1471,7 +1528,7 @@ def _parse_svm_decode_logs_config(
     raw: dict[str, Any], path: str
 ) -> SvmDecodeLogsConfig:
     """Parse svm_decode_logs config including the log signature."""
-    valid_keys = {f.name for f in dataclasses.fields(SvmDecodeLogsConfig)}
+    valid_keys = {f.name for f in dataclasses.fields(SvmDecodeLogsConfig)} | {"hstack"}
     unknown = set(raw.keys()) - valid_keys
     if unknown:
         raise YamlConfigError(
@@ -1498,7 +1555,7 @@ def _parse_svm_decode_logs_config(
         allow_decode_fail=raw.get("allow_decode_fail", False),
         input_table=raw.get("input_table", "logs"),
         output_table=raw.get("output_table", "decoded_logs"),
-        hstack=raw.get("hstack", True),
+        original_columns=_parse_original_columns(raw, path, evm=False),
     )
 
 

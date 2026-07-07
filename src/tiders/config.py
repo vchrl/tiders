@@ -11,9 +11,10 @@ This module defines every configuration type used to assemble a pipeline:
 """
 
 import logging
-from dataclasses import dataclass, field
+import warnings
+from dataclasses import dataclass, field, InitVar
 from enum import Enum
-from typing import Any, Dict, List, Optional, Callable, TYPE_CHECKING
+from typing import Any, Dict, List, Literal, Optional, Union, Callable, TYPE_CHECKING
 
 from tiders_core.ingest import ProviderConfig, Query
 from tiders_core.svm_decode import InstructionSignature, LogSignature
@@ -353,6 +354,63 @@ class Writer:
     )
 
 
+class OriginalColumns(str, Enum):
+    """How much of a decode step's input row to keep alongside the decoded columns.
+
+    Replaces the older boolean ``hstack`` option:
+
+    * ``ALL`` – keep every original input column (equivalent to ``hstack=True``).
+    * ``NONE`` – keep only the decoded columns (equivalent to ``hstack=False``).
+    * ``DROP_ALL_RAW`` – keep the original columns except the raw, encoded
+      columns that were consumed for decoding (for EVM: ``data`` and
+      ``topic0``–``topic3``; for SVM instructions: ``data``, ``a0``–``a9`` and
+      ``rest_of_accounts``; for SVM logs: ``message``).
+    * ``DROP_EXCEPT_TOPIC0`` – EVM only. Like ``DROP_ALL_RAW`` but keeps
+      ``topic0`` (the event selector). Invalid for SVM decode steps.
+    """
+
+    ALL = "all"
+    NONE = "none"
+    DROP_ALL_RAW = "drop_all_raw"
+    DROP_EXCEPT_TOPIC0 = "drop_except_topic0"
+
+
+# Accepted by the decode configs' ``original_columns`` field: either an
+# ``OriginalColumns`` member or its string value (coerced to the enum in
+# ``__post_init__``). Lets callers write ``original_columns="all"``.
+OriginalColumnsInput = Union[
+    OriginalColumns,
+    Literal["all", "none", "drop_all_raw", "drop_except_topic0"],
+]
+
+
+def _resolve_legacy_hstack(
+    current: OriginalColumnsInput, hstack: Optional[bool]
+) -> OriginalColumns:
+    """Map the deprecated boolean ``hstack`` onto an :class:`OriginalColumns`.
+
+    Used by the decode-step configs' ``__post_init__`` so that existing SDK code
+    passing ``hstack=True``/``False`` keeps working. Returns ``current`` when
+    ``hstack`` is not supplied.
+    """
+    # Normalize whatever was passed (enum member or raw string) to a canonical
+    # OriginalColumns member so downtream `is` comparisons are valid.
+    current = OriginalColumns(current)
+    if hstack is None:
+        return current
+    if current is not OriginalColumns.ALL:
+        raise ValueError(
+            "Pass only one of 'original_columns' or the deprecated 'hstack'."
+        )
+    warnings.warn(
+        "'hstack' is deprecated; use 'original_columns' "
+        "(all/none/drop_all_raw/drop_except_topic0).",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+    return OriginalColumns.ALL if hstack else OriginalColumns.NONE
+
+
 @dataclass
 class EvmDecodeEventsConfig:
     """Configuration for the EVM event log decoding step.
@@ -371,8 +429,11 @@ class EvmDecodeEventsConfig:
             (default ``"logs"``).
         output_table: Name of the output table for decoded results
             (default ``"decoded_logs"``).
-        hstack: When ``True`` (the default), decoded columns are horizontally
-            stacked with the original input columns.
+        hstack (deprecated): Replaced by ``original_columns``. When ``True`` (the default), decoded columns are horizontally
+        stacked with the original input columns.
+        original_columns: How much of the original input row to keep alongside
+            the decoded columns. See :class:`OriginalColumns`. Defaults to
+            ``ALL``. All four modes are valid for EVM events.
         large_int_as_binary: When ``True``, signed and unsigned integers wider
             than 64 bits (``int128``/``int256``/``uint128``/``uint256``) are
             emitted as 32-byte big-endian ``Binary`` columns (two's-complement
@@ -385,8 +446,12 @@ class EvmDecodeEventsConfig:
     filter_by_topic0: bool = False
     input_table: str = "logs"
     output_table: str = "decoded_logs"
-    hstack: bool = True
+    original_columns: OriginalColumnsInput = OriginalColumns.ALL
     large_int_as_binary: bool = False
+    hstack: InitVar[Optional[bool]] = None
+
+    def __post_init__(self, hstack: Optional[bool]) -> None:
+        self.original_columns = _resolve_legacy_hstack(self.original_columns, hstack)
 
 
 @dataclass
@@ -406,8 +471,11 @@ class SvmDecodeInstructionsConfig:
         input_table: Name of the source table (default ``"instructions"``).
         output_table: Name of the output table
             (default ``"decoded_instructions"``).
-        hstack: When ``True``, decoded columns are stacked alongside the
-            original input columns.
+        hstack (deprecated): Replaced by ``original_columns``. When ``True`` (the default), decoded columns are horizontally
+        stacked with the original input columns.
+        original_columns: How much of the original input row to keep alongside
+            the decoded columns. See :class:`OriginalColumns`. Defaults to
+            ``ALL``. ``DROP_EXCEPT_TOPIC0`` is EVM-only and invalid here.
     """
 
     instruction_signature: InstructionSignature
@@ -415,7 +483,11 @@ class SvmDecodeInstructionsConfig:
     filter_by_discriminator: bool = False
     input_table: str = "instructions"
     output_table: str = "decoded_instructions"
-    hstack: bool = True
+    original_columns: OriginalColumnsInput = OriginalColumns.ALL
+    hstack: InitVar[Optional[bool]] = None
+
+    def __post_init__(self, hstack: Optional[bool]) -> None:
+        self.original_columns = _resolve_legacy_hstack(self.original_columns, hstack)
 
 
 @dataclass
@@ -431,15 +503,22 @@ class SvmDecodeLogsConfig:
             instead of raising an error.
         input_table: Name of the source table (default ``"logs"``).
         output_table: Name of the output table (default ``"decoded_logs"``).
-        hstack: When ``True``, decoded columns are stacked alongside the
-            original input columns.
+        hstack (deprecated): Replaced by ``original_columns``. When ``True`` (the default), decoded columns are horizontally
+        stacked with the original input columns.
+        original_columns: How much of the original input row to keep alongside
+            the decoded columns. See :class:`OriginalColumns`. Defaults to
+            ``ALL``. ``DROP_EXCEPT_TOPIC0`` is EVM-only and invalid here.
     """
 
     log_signature: LogSignature
     allow_decode_fail: bool = False
     input_table: str = "logs"
     output_table: str = "decoded_logs"
-    hstack: bool = True
+    original_columns: OriginalColumnsInput = OriginalColumns.ALL
+    hstack: InitVar[Optional[bool]] = None
+
+    def __post_init__(self, hstack: Optional[bool]) -> None:
+        self.original_columns = _resolve_legacy_hstack(self.original_columns, hstack)
 
 
 @dataclass
@@ -1041,6 +1120,7 @@ __all__ = [
     "Pipeline",
     "CheckpointConfig",
     "Step",
+    "OriginalColumns",
     "EvmDecodeEventsConfig",
     "EvmTableAliases",
     "SvmTableAliases",

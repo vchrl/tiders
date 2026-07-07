@@ -50,14 +50,16 @@ steps:
 
   - kind: hex_encode
 
-  - kind: sql
-    config:
-      queries:
-        - >
-          CREATE OR REPLACE TABLE transfers AS
-          SELECT transfers.*, blocks.timestamp AS block_timestamp
-          FROM transfers
-          INNER JOIN blocks ON blocks.number = transfers.block_number
+# This step demonstrates the use of SQL transformations using DataFusion to join block_timestamp from blocks to the transfers table.
+# It requires the optional dependency tiders[datafusion] to be installed with tiders (`uv pip install tiders[datafusion]`). The step kind: join_block_data is a shorthand for it.
+  # - kind: sql
+  #   config:
+  #     queries:
+  #       - >
+  #         CREATE OR REPLACE TABLE transfers AS
+  #         SELECT transfers.*, blocks.timestamp AS block_timestamp
+  #         FROM transfers
+  #         INNER JOIN blocks ON blocks.number = transfers.block_number
 
 writer:
   kind: pyarrow_dataset

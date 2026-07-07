@@ -156,8 +156,11 @@ query = Query(
 # STEP 1: EVM_DECODE_EVENTS: decodes the raw log data (topic1..3 + data) into named
 #   columns using the event signature.
 #   - allow_decode_fail: if True, rows that fail to decode are kept (with nulls)
-#   - hstack: if False, outputs only decoded columns; if True, append them to
-#     the original raw log columns
+#   - original_columns: how much of the original log row to keep alongside the
+#     decoded columns. One of "all" (keep every original column), "none"
+#     (decoded columns only), "drop_all_raw" (keep originals except the raw
+#     encoded columns data/topic0..topic3), or "drop_except_topic0" (like
+#     drop_all_raw but keep topic0; EVM only).
 #
 # STEP 2: HEX_ENCODE: converts binary columns (addresses, hashes) to hex strings,
 #   making them human-readable and compatible with databases like DuckDB.
@@ -169,7 +172,7 @@ steps = [
             event_signature=erc20_events["Transfer"]["signature"],
             allow_decode_fail=True,
             output_table="transfers",
-            hstack=True,
+            original_columns="all",
         ),
     ),
     Step(

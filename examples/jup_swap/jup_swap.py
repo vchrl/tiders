@@ -156,7 +156,7 @@ async def main(
             kind=cc.StepKind.SVM_DECODE_INSTRUCTIONS,
             config=cc.SvmDecodeInstructionsConfig(
                 instruction_signature=instruction_signature,
-                hstack=True,
+                original_columns="all",
                 allow_decode_fail=True,
                 output_table="jup_swaps_decoded_instructions",
             ),
