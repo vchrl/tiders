@@ -101,7 +101,7 @@ def default_handler(
     return handler
 
 
-def writer_with(handler, anchor_table="blocks"):
+def writer_with(handler, anchor_table="blocks", create_tables=True):
     client = FakeClient("default", handler)
     config = type(
         "Cfg",
@@ -115,7 +115,7 @@ def writer_with(handler, anchor_table="blocks"):
             "order_by": {},
             "skip_index": {},
             "engine": "MergeTree()",
-            "create_tables": True,
+            "create_tables": create_tables,
         },
     )()
     return Writer(config), client
@@ -148,6 +148,26 @@ def test_probe_regex_matches_tiders_text_and_not_a_prefixed_or_suffixed_table():
     assert pattern.match("INSERT INTO logs (block_number) FORMAT Arrow")
     assert not pattern.match("INSERT INTO default.logs (")
     assert not pattern.match("INSERT INTO logs_archive (")
+
+
+def test_probe_includes_the_anchor_so_a_blocks_insert_is_waited_out():
+    # Spec addendum D: a dead process's `blocks` INSERT must be in the wait, or
+    # the anchor assert can run before it commits and `blocks` is written twice.
+    # Drive the writer and read the probe it actually issues, so dropping the
+    # anchor from the call site goes red (a direct probe_sql call would not).
+    writer, client = writer_with(default_handler(floors={"transactions": (0, 0)}))
+    run(writer.push_data({"transactions": table([100, 101]), "blocks": table([100, 101])}))
+    probes = [q["sql"] for q in client.queries if "system.processes" in q["sql"]]
+    assert probes, "the in-flight probe ran"
+    assert all("uniswap_v3_swaps|blocks)" in sql for sql in probes)
+    pattern = re.compile(
+        r"^INSERT INTO (transactions|logs|erc20_transfers|uniswap_v2_swaps|uniswap_v3_swaps|blocks) [(]"
+    )
+    assert pattern.match("INSERT INTO blocks (number) FORMAT Arrow")
+    # Without an anchor argument the alternation stays the child set only.
+    no_anchor, params = probe_sql("default", "default")
+    assert "blocks" not in no_anchor
+    assert params == {"db": "default", "user": "default"}
 
 
 def test_floor_read_is_bounded_and_capped():
@@ -233,6 +253,19 @@ def test_floor_applies_only_on_the_first_batch():
     assert client.inserts[-2]["rows"] == 4
 
 
+def test_every_resume_floor_query_carries_read_caps():
+    # Catches dropping READ_CAPS from the probe, the anchor read, the MV
+    # definition read or the MV uniqExact reads. create_tables=False keeps the
+    # pre-existing table-exists read (upstream, outside this fork) out of the run,
+    # so this asserts the fork's own read surface.
+    writer, client = writer_with(
+        default_handler(floors={"logs": (4, 101)}), create_tables=False
+    )
+    run(writer.push_data(_logs_data()))
+    assert client.queries, "the floor path issued reads"
+    assert all(q["settings"] == READ_CAPS for q in client.queries)
+
+
 # --------------------------------------------------------------------------
 # In-flight wait and anchor assert
 # --------------------------------------------------------------------------
@@ -253,6 +286,41 @@ def test_inflight_insert_that_does_not_clear_refuses(monkeypatch):
     assert client.inserts == []
 
 
+def test_empty_probe_result_refuses_the_write():
+    # A healthy count() never returns zero rows; an empty result fails open if it
+    # is read as "0 in flight" (Cyber Security, non-blocking item).
+    def handler(sql, parameters):
+        if "system.processes" in sql:
+            return FakeResult([])
+        return default_handler()(sql, parameters)
+
+    writer, client = writer_with(handler)
+    with pytest.raises(RuntimeError):
+        run(writer.push_data({"transactions": table([100, 101]), "blocks": table([100, 101])}))
+    assert client.inserts == []
+
+
+def test_empty_anchor_result_refuses_the_write():
+    def handler(sql, parameters):
+        if sql.startswith("SELECT max(number) FROM"):
+            return FakeResult([])
+        return default_handler()(sql, parameters)
+
+    writer, client = writer_with(handler)
+    with pytest.raises(RuntimeError):
+        run(writer.push_data({"transactions": table([100, 101]), "blocks": table([100, 101])}))
+    assert client.inserts == []
+
+
+def test_a_null_anchor_does_not_refuse():
+    # An empty anchor table is not a violation: there is no committed row to sit
+    # at or above the batch start. Only a missing row refuses.
+    writer, client = writer_with(default_handler(anchor_max=None, floors={"transactions": (0, 0)}))
+    run(writer.push_data({"transactions": table([100, 101]), "blocks": table([100, 101])}))
+    inserts = {i["table"]: i["rows"] for i in client.inserts}
+    assert inserts["transactions"] == 2
+
+
 # --------------------------------------------------------------------------
 # Part-cut refusal
 # --------------------------------------------------------------------------
@@ -266,6 +334,39 @@ def test_oversized_batch_is_refused_with_a_grep_able_line(capsys):
     assert client.inserts == []
     out = capsys.readouterr().out
     assert "TIDERS_RESUME_REFUSAL table=transactions size=4 bound=max_insert_block_size=2" in out
+
+
+def test_oversized_later_batch_is_refused_the_same_as_the_first():
+    # Spec addendum B: the batch that crashes can be any batch, so the check must
+    # not be tied to the first-batch floor. A small first batch is written; a
+    # later batch over the bound writes nothing.
+    settings = [("max_insert_block_size", "3"), ("min_insert_block_size_bytes", str(512 * 1024 * 1024))]
+    writer, client = writer_with(default_handler(settings=settings))
+    run(writer.push_data({"transactions": table([100, 101]), "blocks": table([100, 101])}))
+    written = len(client.inserts)
+    assert written == 2
+    with pytest.raises(RuntimeError):
+        run(
+            writer.push_data(
+                {"transactions": table([100, 101, 102, 103]), "blocks": table([100, 101, 102, 103])}
+            )
+        )
+    assert len(client.inserts) == written
+    # The bounds are read once, not per batch.
+    bound_reads = [q for q in client.queries if q["sql"].startswith("SELECT name, value FROM system.settings")]
+    assert len(bound_reads) == 1
+
+
+def test_byte_oversized_batch_is_refused_with_a_grep_able_line(capsys):
+    # The Architect's mutant dropped the nbytes arm and the suite stayed green.
+    settings = [("max_insert_block_size", "1000000"), ("min_insert_block_size_bytes", "1")]
+    writer, client = writer_with(default_handler(settings=settings))
+    with pytest.raises(RuntimeError):
+        run(writer.push_data({"transactions": table([100, 101]), "blocks": table([100, 101])}))
+    assert client.inserts == []
+    out = capsys.readouterr().out
+    assert "TIDERS_RESUME_REFUSAL table=transactions" in out
+    assert "bound=min_insert_block_size_bytes=1" in out
 
 
 def test_missing_bound_setting_refuses_the_write():
@@ -351,6 +452,7 @@ def test_the_view_select_is_read_from_the_server_not_retyped():
     sql = mv_definition_sql("mv_curve_swaps")
     assert "FROM system.tables" in sql
     assert "'MaterializedView'" in sql
+    assert "database = currentDatabase()" in sql
     assert "'mv_curve_swaps'" in sql
     select = mv_select_from_definition(
         "CREATE MATERIALIZED VIEW default.mv TO default.t (a UInt64) AS SELECT a FROM logs WHERE x = 1",

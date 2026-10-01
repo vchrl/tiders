@@ -186,7 +186,9 @@ def pyarrow_type_to_clickhouse(dt: pa.DataType) -> str:
         raise Exception(f"Unimplemented pyarrow type: {dt}")
 
 
-def probe_sql(database: str, username: str) -> tuple[str, Dict[str, str]]:
+def probe_sql(
+    database: str, username: str, anchor_table: Optional[str] = None
+) -> tuple[str, Dict[str, str]]:
     """The in-flight INSERT probe, with database and user as server parameters.
 
     An unqualified ``INSERT INTO logs`` resolves against the current database, so
@@ -194,8 +196,17 @@ def probe_sql(database: str, username: str) -> tuple[str, Dict[str, str]]:
     refinement 1). ``query_kind = 'Insert'`` and ``query_id != queryID()`` keep
     the probe from matching itself (Cyber Security item 5). The table alternation
     is anchored at the statement head so a ``logs_archive`` INSERT does not match.
+
+    The anchor table joins the alternation (spec addendum D): a dead process's
+    ``blocks`` INSERT must be waited out too, or the anchor assert can run before
+    it commits. Widening the probe only widens detection, never the write surface.
     """
-    alternation = "|".join(CHILD_TABLES)
+    tables = list(CHILD_TABLES)
+    if anchor_table is not None:
+        anchor = _assert_identifier(anchor_table, "anchor table")
+        if anchor not in tables:
+            tables.append(anchor)
+    alternation = "|".join(tables)
     sql = (
         "SELECT count() FROM system.processes "
         "WHERE query_kind = 'Insert' "
@@ -229,7 +240,9 @@ def mv_definition_sql(mv: str) -> str:
     """The `CREATE MATERIALIZED VIEW` text for one view, to read its SELECT."""
     return (
         "SELECT create_table_query FROM system.tables "
-        f"WHERE engine = 'MaterializedView' AND name = '{_assert_identifier(mv, 'view')}'"
+        "WHERE engine = 'MaterializedView' "
+        "AND database = currentDatabase() "
+        f"AND name = '{_assert_identifier(mv, 'view')}'"
     )
 
 
@@ -310,6 +323,7 @@ class Writer(DataWriter):
         self.skip_index = config.skip_index
         self.first_insert = True
         self._floor_applied = False
+        self._insert_bounds: Optional[Dict[str, int]] = None
         self.anchor_table = config.anchor_table
         self.engine = config.engine
         self.create_tables = config.create_tables
@@ -436,14 +450,18 @@ class Writer(DataWriter):
 
         A dead process's `blocks` INSERT can commit after the new start was
         computed; the anchor assert closes that case (spec addendum D). A wait
-        that runs out, or an anchor at or above start, refuses the write.
+        that runs out, an empty probe or anchor result, or an anchor at or above
+        start refuses the write. A ``NULL`` anchor (an empty anchor table) is the
+        only value that does not: there is no committed row to violate the bound.
         """
         assert self.client is not None
-        sql, parameters = probe_sql(self.database, self.username)
+        sql, parameters = probe_sql(self.database, self.username, self.anchor_table)
         deadline = time.monotonic() + INFLIGHT_WAIT_SECONDS
         while True:
             res = await self.client.query(sql, parameters=parameters, settings=READ_CAPS)
-            inflight = int(res.result_rows[0][0]) if res.result_rows else 0
+            if not res.result_rows or res.result_rows[0][0] is None:
+                raise RuntimeError("in-flight probe returned no row; no write")
+            inflight = int(res.result_rows[0][0])
             if inflight == 0:
                 break
             if time.monotonic() >= deadline:
@@ -458,7 +476,11 @@ class Writer(DataWriter):
         res = await self.client.query(
             anchor_assert_sql(self.anchor_table), settings=READ_CAPS
         )
-        value = res.result_rows[0][0] if res.result_rows else None
+        if not res.result_rows:
+            raise RuntimeError(
+                f"anchor assert for {self.anchor_table} returned no row; no write"
+            )
+        value = res.result_rows[0][0]
         if value is not None and int(value) >= start:
             raise RuntimeError(
                 f"MAX({self.anchor_table}) = {value} >= batch start {start}; no write"
@@ -493,9 +515,14 @@ class Writer(DataWriter):
         print(line, flush=True)
         raise RuntimeError(line)
 
-    async def _refuse_oversized_batches(self, data: Dict[str, pa.Table]) -> None:
-        """Refuse any table whose batch crosses the server's part cut."""
-        bounds = await self._read_insert_bounds()
+    def _refuse_oversized_batches(
+        self, data: Dict[str, pa.Table], bounds: Dict[str, int]
+    ) -> None:
+        """Refuse any table whose batch crosses the server's part cut.
+
+        Runs on every batch, not only the first: the batch that crashes can be
+        any batch, and its one-part premise must hold (spec addendum B).
+        """
         max_rows = bounds["max_insert_block_size"]
         max_bytes = bounds["min_insert_block_size_bytes"]
         for table_name, table in data.items():
@@ -516,7 +543,6 @@ class Writer(DataWriter):
         if start is None:
             return
         await self._wait_for_inflight(start)
-        await self._refuse_oversized_batches(data)
         for table_name in list(data.keys()):
             if table_name not in CHILD_TABLES or table_name == self.anchor_table:
                 continue
@@ -601,6 +627,13 @@ class Writer(DataWriter):
                 await task
 
             self.first_insert = False
+
+        # The server's part-cut check runs on every batch before any INSERT: the
+        # batch that crashes can be any batch, and its one-part premise must hold
+        # (spec addendum B). The bounds are read once and cached for the process.
+        if self._insert_bounds is None:
+            self._insert_bounds = await self._read_insert_bounds()
+        self._refuse_oversized_batches(data, self._insert_bounds)
 
         # resume floor: first batch after process start only
         if not self._floor_applied:
